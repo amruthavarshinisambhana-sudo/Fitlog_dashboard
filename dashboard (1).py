@@ -3,8 +3,10 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import random
+import time
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib import error, request
 import plotly.express as px
 import plotly.graph_objects as go
@@ -350,14 +352,58 @@ def save_workout(user_id, workout_date, workout_name, duration, calories):
     )
 
 
+def normalize_backup_records(records):
+    if not isinstance(records, list):
+        raise ValueError("Backup must contain a workouts list.")
+    normalized = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Each workout in the backup must be an object.")
+        try:
+            workout_date = date.fromisoformat(str(record["date"])).isoformat()
+            workout_name = str(record["workout"]).strip()
+            duration = int(record["duration"])
+            calories = int(record["calories"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("A workout in the backup has invalid fields.") from exc
+        if not workout_name or duration <= 0 or calories < 0:
+            raise ValueError("A workout in the backup has invalid values.")
+        normalized.append(
+            {
+                "date": workout_date,
+                "workout": workout_name,
+                "duration": duration,
+                "calories": calories,
+            }
+        )
+    return normalized
+
+
 def get_gemini_api_key():
+    placeholder = "PASTE_NEW_KEY_HERE"
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
-        if secret_key:
-            return str(secret_key).strip()
+        secret_key = str(secret_key).strip()
+        if secret_key and secret_key != placeholder:
+            return secret_key
     except Exception:
         pass
-    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+    for filename in ("key.txt", "keys.txt"):
+        key_path = BASE_DIR / ".streamlit" / filename
+        try:
+            saved_key = key_path.read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            continue
+        if "=" in saved_key:
+            setting_name, setting_value = saved_key.split("=", 1)
+            if setting_name.strip().upper() in {"KEY", "GEMINI_API_KEY"}:
+                saved_key = setting_value.strip().strip("\"'")
+        if saved_key and saved_key != placeholder:
+            return saved_key
+
+    environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    return "" if environment_key == placeholder else environment_key
 
 
 def ask_gemini(api_key, question, user_df):
@@ -372,46 +418,52 @@ def ask_gemini(api_key, question, user_df):
         f"total calories: {int(user_df['calories'].sum()) if not user_df.empty else 0}; "
         f"minutes by activity: {', '.join(activities) if activities else 'none yet'}."
     )
-    payload = {
-        "systemInstruction": {
-            "parts": [{
-                "text": (
-                    "You are a supportive general fitness coach. Give practical, "
-                    "beginner-friendly suggestions based only on the workout "
-                    "summary provided. Do not diagnose medical conditions."
-                )
-            }]
-        },
-        "contents": [{"parts": [{"text": f"My workout summary: {summary}\nMy question: {question}"}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500},
-    }
-    endpoint = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-3.8-flash:generateContent"
+    prompt = (
+        "You are a supportive general fitness coach. Give practical, "
+        "beginner-friendly suggestions based only on the workout summary. "
+        "Do not diagnose medical conditions.\n\n"
+        f"My workout summary: {summary}\nMy question: {question}"
     )
+    payload = {"model": "gemini-3.8-flash", "input": prompt}
+    endpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
     req = request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
-    try:
-        with request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini API returned HTTP {exc.code}: {details[:400]}") from exc
-    except (error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Could not reach Gemini: {exc}") from exc
+    retryable_statuses = {408, 429, 500, 502, 503, 504}
+    result = None
+    for attempt in range(3):
+        try:
+            with request.urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            if exc.code not in retryable_statuses or attempt == 2:
+                raise RuntimeError(
+                    f"Gemini API returned HTTP {exc.code}: {details[:400]}"
+                ) from exc
+            exc.close()
+        except (error.URLError, TimeoutError) as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Could not reach Gemini: {exc}") from exc
+        time.sleep((2 ** attempt) + random.uniform(0, 0.5))
 
     try:
-        return "\n".join(
+        answer_parts = [
             part["text"]
-            for part in result["candidates"][0]["content"]["parts"]
-            if "text" in part
-        )
-    except (KeyError, IndexError, TypeError) as exc:
+            for step in result.get("steps", [])
+            if step.get("type") == "model_output"
+            for part in step.get("content", [])
+            if part.get("type") == "text" and part.get("text")
+        ]
+        if answer_parts:
+            return "\n".join(answer_parts)
+    except (AttributeError, TypeError) as exc:
         raise RuntimeError("Gemini returned an empty or unexpected response.") from exc
+    raise RuntimeError("Gemini returned no text response.")
 
 
 # --------------------------------------------------
@@ -543,14 +595,121 @@ with st.sidebar:
                 use_container_width=True,
             )
 
-    with st.expander("🤖 Gemini AI Coach", expanded=False):
+    with st.expander("💾 Backup & SQLite", expanded=False):
+        st.caption("Backups contain only the signed-in account's workouts.")
+        backup_records = [
+            {
+                "date": str(row.date),
+                "workout": str(row.workout),
+                "duration": int(row.duration),
+                "calories": int(row.calories),
+            }
+            for row in df.itertuples(index=False)
+        ]
+        safe_username = "".join(
+            character
+            for character in current_username
+            if character.isalnum() or character in "-_"
+        ) or "user"
+        backup_snapshot = {
+            "format": "fitlog-backup-v1",
+            "username": current_username,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "workouts": backup_records,
+        }
+        st.download_button(
+            "Export full JSON snapshot",
+            data=json.dumps(backup_snapshot, indent=2).encode("utf-8"),
+            file_name=f"fitlog_{safe_username}_backup_{today.isoformat()}.json",
+            mime="application/json",
+            key=f"json_backup_{current_user_id}",
+            use_container_width=True,
+        )
+
+        sql_lines = [
+            "-- FitLog workout backup; only this account's workout records.",
+            "CREATE TABLE IF NOT EXISTS fitlog_backup (",
+            "    date TEXT NOT NULL,",
+            "    workout TEXT NOT NULL,",
+            "    duration INTEGER NOT NULL,",
+            "    calories INTEGER NOT NULL",
+            ");",
+        ]
+        for record in backup_records:
+            quoted_workout = record["workout"].replace("'", "''")
+            sql_lines.append(
+                "INSERT INTO fitlog_backup (date, workout, duration, calories) "
+                f"VALUES ('{record['date']}', '{quoted_workout}', "
+                f"{record['duration']}, {record['calories']});"
+            )
+        st.download_button(
+            "Export SQLite SQL dump",
+            data="\n".join(sql_lines).encode("utf-8"),
+            file_name=f"fitlog_{safe_username}_backup_{today.isoformat()}.sql",
+            mime="application/sql",
+            key=f"sql_backup_{current_user_id}",
+            use_container_width=True,
+        )
+
+        uploaded_backup = st.file_uploader(
+            "Restore workouts from a FitLog JSON snapshot",
+            type=["json"],
+            key=f"restore_backup_{current_user_id}",
+        )
+        if st.button(
+            "Restore JSON backup to my account",
+            disabled=uploaded_backup is None,
+            key=f"restore_backup_button_{current_user_id}",
+            use_container_width=True,
+        ):
+            try:
+                snapshot = json.loads(uploaded_backup.getvalue().decode("utf-8"))
+                if not isinstance(snapshot, dict) or snapshot.get("format") != "fitlog-backup-v1":
+                    raise ValueError("Choose a FitLog JSON snapshot.")
+                restore_records = normalize_backup_records(snapshot.get("workouts"))
+                existing_rows = list_user_workouts(current_user_id)
+                existing_keys = {
+                    (
+                        str(row["date"]),
+                        str(row["workout"]),
+                        int(row["duration"]),
+                        int(row["calories"]),
+                    )
+                    for row in existing_rows
+                }
+                restored = 0
+                for record in restore_records:
+                    record_key = (
+                        record["date"],
+                        record["workout"],
+                        record["duration"],
+                        record["calories"],
+                    )
+                    if record_key not in existing_keys:
+                        save_user_workout(current_user_id, record)
+                        existing_keys.add(record_key)
+                        restored += 1
+                st.success(
+                    f"Restored {restored} workout(s). Existing matching records were skipped."
+                )
+                st.rerun()
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                st.error(f"Could not restore that backup: {exc}")
+
+    with st.expander("✨ Ask AI Gemini", expanded=False):
         gemini_key = get_gemini_api_key()
         if not gemini_key:
-            st.info(
-                "Add your Gemini key to `.streamlit/secrets.toml` to enable the coach. "
-                "See README.md for setup."
+            st.caption(
+                "Create a Gemini API key in Google AI Studio. It stays in this "
+                "browser session and is not saved to your project files."
             )
-        else:
+            gemini_key = st.text_input(
+                "Gemini API key",
+                type="password",
+                key=f"gemini_session_key_{current_user_id}",
+                help="Paste your key here. It is kept only for this active app session.",
+            )
+        if gemini_key:
             st.caption(
                 "Your question and a summary of your workouts are sent to Google Gemini."
             )
@@ -560,7 +719,7 @@ with st.sidebar:
                 placeholder="Example: How can I build a balanced weekly routine?",
             )
             if st.button(
-                "Ask Gemini",
+                "Ask AI Gemini",
                 key=f"ask_gemini_{current_user_id}",
                 use_container_width=True,
             ):
@@ -577,6 +736,34 @@ with st.sidebar:
             answer = st.session_state.get(f"gemini_answer_{current_user_id}")
             if answer:
                 st.markdown(answer)
+
+    with st.expander("❓ FitLog FAQ", expanded=False):
+        st.markdown("**How do I record a workout?**")
+        st.caption("Use Log a Workout on the dashboard, fill in the details, then select Save Workout.")
+
+        st.markdown("**How do I download my own report?**")
+        st.caption("Open My Data Report in the sidebar and select Download my report (CSV).")
+
+        st.markdown("**How do I back up or restore my workouts?**")
+        st.caption(
+            "Open Backup & SQLite. Download a JSON snapshot or SQL dump, or choose "
+            "a FitLog JSON snapshot and restore it to your signed-in account."
+        )
+
+        st.markdown("**Where do I change my daily goals?**")
+        st.caption("Use the Daily Goals controls in the sidebar. The dashboard updates your progress from your workouts.")
+
+        st.markdown("**Why can’t I see another account’s workouts?**")
+        st.caption("FitLog keeps each account’s workout history separate. Sign in with the account that recorded those workouts.")
+
+        st.markdown("**What if Gemini shows a 503 error?**")
+        st.caption("Gemini may be temporarily busy. Wait a little and try Ask Gemini again. The FAQ works without a Gemini key.")
+
+        st.markdown("**How do I view the project tests?**")
+        st.caption(
+            "The tests are in the tests folder. GitHub Actions runs them after "
+            "you push a commit; open the repository's Actions tab to see the result."
+        )
 
     st.divider()
     st.markdown("### 💡 Quick Tips")

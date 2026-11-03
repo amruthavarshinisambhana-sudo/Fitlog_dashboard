@@ -17,20 +17,15 @@ Create an account from the **Sign up** tab the first time you open it. Sign in a
 
 Use **Log a Workout** to enter an activity. The dashboard stores it in SQLite under the signed-in account. The sidebar's **My Data Report** downloads only that account's workouts as CSV. The Workout History section also has filters and a CSV download.
 
+## Back up and restore data
+
+Open **Backup & SQLite** in the sidebar. **Export full JSON snapshot** creates a backup of the signed-in account's workouts. **Export SQLite SQL dump** downloads SQL statements that can be opened with SQLite tools. To restore, upload a FitLog JSON snapshot and select **Restore JSON backup to my account**. Existing matching workouts are skipped to avoid duplicates. CSV download is available under **My Data Report**.
+
 ## Enable the Gemini AI Coach
 
-The optional coach uses Google's Gemini `generateContent` API. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then:
+The optional coach uses Google's Gemini Interactions API. Create an authorization key in [Google AI Studio](https://aistudio.google.com/api-keys), open **Ask AI Gemini** in the sidebar, and paste the key into the masked **Gemini API key** field. The key stays in the active Streamlit session and is not saved to the project files. Do not share the key. When you ask Gemini a question, the app sends that question and a summary of your signed-in account's workouts to Google.
 
-1. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`.
-2. Replace the placeholder with your key, keeping the quotes:
-
-   ```toml
-   GEMINI_API_KEY = "your-key-goes-here"
-   ```
-
-3. Restart Streamlit and open **Gemini AI Coach** in the sidebar.
-
-The secrets file is ignored by Git. Do not commit or share the real key. When you ask Gemini a question, the app sends that question and a summary of your signed-in account's workouts to Google.
+For repeat local use, you can instead save the key in `.streamlit/secrets.toml` as `GEMINI_API_KEY = "your-key"`. That file is ignored by Git; never commit it.
 
 ## Local API
 
