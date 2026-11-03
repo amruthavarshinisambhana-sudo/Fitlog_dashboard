@@ -1,11 +1,21 @@
 
 import streamlit as st
 import pandas as pd
-import sqlite3
+import json
+import os
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
+from urllib import error, request
 import plotly.express as px
 import plotly.graph_objects as go
+
+from fitlog_store import (
+    authenticate_user,
+    create_user,
+    init_db,
+    list_workouts as list_user_workouts,
+    save_workout as save_user_workout,
+)
 
 # --------------------------------------------------
 # FITLOG - SMART WORKOUT TRACKER
@@ -20,7 +30,6 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_FILE = BASE_DIR / "workouts.csv"
-DB_FILE = BASE_DIR / "fitlog.db"
 
 MINT = "#A9E8C0"
 LAVENDER = "#D8C4FF"
@@ -322,120 +331,156 @@ def clean_dataframe(df):
     return df.reset_index(drop=True)
 
 
-def load_workouts():
-    """Read workout history from CSV and SQLite, if available."""
-    frames = []
+def load_workouts(user_id):
+    """Load only the signed-in user's records from SQLite."""
+    rows = list_user_workouts(user_id)
+    return clean_dataframe(pd.DataFrame(rows))
 
-    if CSV_FILE.exists():
-        try:
-            frames.append(clean_dataframe(pd.read_csv(CSV_FILE)))
-        except Exception as exc:
-            st.warning(f"Could not read workouts.csv: {exc}")
 
-    if DB_FILE.exists():
-        try:
-            with sqlite3.connect(DB_FILE) as conn:
-                tables = pd.read_sql_query(
-                    "SELECT name FROM sqlite_master WHERE type='table'",
-                    conn,
-                )["name"].tolist()
-
-                if "workouts" in tables:
-                    db_df = pd.read_sql_query(
-                        "SELECT * FROM workouts", conn
-                    )
-                    frames.append(clean_dataframe(db_df))
-        except Exception as exc:
-            st.warning(f"Could not read fitlog.db: {exc}")
-
-    if not frames:
-        return pd.DataFrame(
-            columns=["date", "workout", "duration", "calories"]
-        )
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.drop_duplicates(
-        subset=["date", "workout", "duration", "calories"]
+def save_workout(user_id, workout_date, workout_name, duration, calories):
+    """Save a workout under the current account."""
+    save_user_workout(
+        user_id,
+        {
+            "date": workout_date.isoformat(),
+            "workout": workout_name,
+            "duration": duration,
+            "calories": calories,
+        },
     )
-    return combined.sort_values("date", ascending=False).reset_index(drop=True)
 
 
-def save_workout(workout_date, workout_name, duration, calories):
-    """Save one workout to CSV and SQLite."""
-    record = {
-        "date": workout_date.isoformat(),
-        "workout": workout_name,
-        "duration": int(duration),
-        "calories": int(calories),
+def get_gemini_api_key():
+    try:
+        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        if secret_key:
+            return str(secret_key).strip()
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def ask_gemini(api_key, question, user_df):
+    """Ask Gemini for a fitness suggestion using this user's summary only."""
+    activities = []
+    if not user_df.empty:
+        totals = user_df.groupby("workout")["duration"].sum().to_dict()
+        activities = [f"{name}: {int(minutes)} minutes" for name, minutes in totals.items()]
+    summary = (
+        f"Workouts recorded: {len(user_df)}; "
+        f"total minutes: {int(user_df['duration'].sum()) if not user_df.empty else 0}; "
+        f"total calories: {int(user_df['calories'].sum()) if not user_df.empty else 0}; "
+        f"minutes by activity: {', '.join(activities) if activities else 'none yet'}."
+    )
+    payload = {
+        "systemInstruction": {
+            "parts": [{
+                "text": (
+                    "You are a supportive general fitness coach. Give practical, "
+                    "beginner-friendly suggestions based only on the workout "
+                    "summary provided. Do not diagnose medical conditions."
+                )
+            }]
+        },
+        "contents": [{"parts": [{"text": f"My workout summary: {summary}\nMy question: {question}"}]}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500},
     }
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-3.8-flash:generateContent"
+    )
+    req = request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini API returned HTTP {exc.code}: {details[:400]}") from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not reach Gemini: {exc}") from exc
 
-    # Save to CSV.
-    if CSV_FILE.exists():
-        try:
-            old_csv = pd.read_csv(CSV_FILE)
-            old_csv = old_csv.rename(
-                columns={
-                    "workout_type": "workout",
-                    "activity": "workout",
-                    "duration_minutes": "duration",
-                    "calories_burned": "calories",
-                    "workout_date": "date",
-                }
-            )
-            for col in ["date", "workout", "duration", "calories"]:
-                if col not in old_csv.columns:
-                    old_csv[col] = None
-            old_csv = old_csv[["date", "workout", "duration", "calories"]]
-        except Exception:
-            old_csv = pd.DataFrame(
-                columns=["date", "workout", "duration", "calories"]
-            )
-    else:
-        old_csv = pd.DataFrame(
-            columns=["date", "workout", "duration", "calories"]
+    try:
+        return "\n".join(
+            part["text"]
+            for part in result["candidates"][0]["content"]["parts"]
+            if "text" in part
         )
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Gemini returned an empty or unexpected response.") from exc
 
-    new_csv = pd.concat([old_csv, pd.DataFrame([record])], ignore_index=True)
-    new_csv.to_csv(CSV_FILE, index=False)
 
-    # Save to SQLite. Preserve any existing workouts table.
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS workouts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                workout TEXT NOT NULL,
-                duration INTEGER NOT NULL,
-                calories INTEGER NOT NULL
+# --------------------------------------------------
+# ACCOUNT SIGN-IN / SIGN-UP
+# --------------------------------------------------
+
+init_db()
+
+if "fitlog_user_id" not in st.session_state:
+    st.markdown("## 🌿 Welcome to FitLog")
+    st.caption("Sign in to see your private workout history, or create an account.")
+    login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+
+    with login_tab:
+        with st.form("fitlog_login_form"):
+            login_username = st.text_input("Username", key="login_username")
+            login_password = st.text_input(
+                "Password", type="password", key="login_password"
             )
-            """
+            login_submitted = st.form_submit_button("Log in", use_container_width=True)
+        if login_submitted:
+            user = authenticate_user(login_username, login_password)
+            if user:
+                st.session_state["fitlog_user_id"] = user["id"]
+                st.session_state["fitlog_username"] = user["username"]
+                st.rerun()
+            st.error("Username or password is incorrect.")
+
+    with signup_tab:
+        st.info(
+            "Your password is stored as a secure hash. Existing workout records "
+            "will belong to the first account created."
         )
-
-        columns = [
-            row[1]
-            for row in conn.execute("PRAGMA table_info(workouts)").fetchall()
-        ]
-
-        if all(col in columns for col in ["date", "workout", "duration", "calories"]):
-            conn.execute(
-                """
-                INSERT INTO workouts (date, workout, duration, calories)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    record["date"],
-                    record["workout"],
-                    record["duration"],
-                    record["calories"],
-                ),
+        with st.form("fitlog_signup_form"):
+            signup_username = st.text_input("Choose a username", key="signup_username")
+            signup_password = st.text_input(
+                "Choose a password (8+ characters)",
+                type="password",
+                key="signup_password",
             )
-        else:
-            raise ValueError(
-                "Your existing workouts table has a different structure. "
-                "The CSV was saved, but the SQLite record could not be added."
+            confirm_password = st.text_input(
+                "Confirm password", type="password", key="confirm_password"
             )
+            signup_submitted = st.form_submit_button(
+                "Create account", use_container_width=True
+            )
+        if signup_submitted:
+            if signup_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                try:
+                    user = create_user(
+                        signup_username,
+                        signup_password,
+                        legacy_csv_file=CSV_FILE,
+                    )
+                    st.session_state["fitlog_user_id"] = user["id"]
+                    st.session_state["fitlog_username"] = user["username"]
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+    st.stop()
 
+current_user_id = st.session_state["fitlog_user_id"]
+current_username = st.session_state["fitlog_username"]
+df = load_workouts(current_user_id)
+today = date.today()
+if not df.empty:
+    df["date"] = pd.to_datetime(df["date"]).dt.date
 
 # --------------------------------------------------
 # SIDEBAR
@@ -444,6 +489,11 @@ def save_workout(workout_date, workout_name, duration, calories):
 with st.sidebar:
     st.markdown("## 🌿 FitLog")
     st.caption("Your personal fitness companion")
+    st.caption(f"Signed in as **{current_username}**")
+    if st.button("Log out", use_container_width=True):
+        st.session_state.pop("fitlog_user_id", None)
+        st.session_state.pop("fitlog_username", None)
+        st.rerun()
     st.divider()
 
     st.markdown("### 🎯 Daily Goals")
@@ -453,7 +503,7 @@ with st.sidebar:
         max_value=600,
         value=30,
         step=5,
-        key="daily_minutes_goal",
+        key=f"daily_minutes_goal_{current_user_id}",
     )
     daily_calories_goal = st.number_input(
         "Calories to burn",
@@ -461,7 +511,7 @@ with st.sidebar:
         max_value=10000,
         value=300,
         step=50,
-        key="daily_calories_goal",
+        key=f"daily_calories_goal_{current_user_id}",
     )
     daily_sessions_goal = st.number_input(
         "Workout sessions",
@@ -469,8 +519,64 @@ with st.sidebar:
         max_value=20,
         value=1,
         step=1,
-        key="daily_sessions_goal",
+        key=f"daily_sessions_goal_{current_user_id}",
     )
+
+    st.divider()
+    with st.expander("📄 My Data Report", expanded=False):
+        if df.empty:
+            st.caption("Log a workout to create your personal report.")
+        else:
+            personal_csv = df.sort_values("date", ascending=False).copy()
+            personal_csv["date"] = personal_csv["date"].astype(str)
+            safe_username = "".join(
+                character
+                for character in current_username
+                if character.isalnum() or character in "-_"
+            ) or "user"
+            st.download_button(
+                "Download my report (CSV)",
+                data=personal_csv.to_csv(index=False).encode("utf-8"),
+                file_name=f"fitlog_{safe_username}_report_{today.isoformat()}.csv",
+                mime="text/csv",
+                key=f"sidebar_report_{current_user_id}",
+                use_container_width=True,
+            )
+
+    with st.expander("🤖 Gemini AI Coach", expanded=False):
+        gemini_key = get_gemini_api_key()
+        if not gemini_key:
+            st.info(
+                "Add your Gemini key to `.streamlit/secrets.toml` to enable the coach. "
+                "See README.md for setup."
+            )
+        else:
+            st.caption(
+                "Your question and a summary of your workouts are sent to Google Gemini."
+            )
+            question = st.text_area(
+                "Ask about your workout progress",
+                key=f"gemini_question_{current_user_id}",
+                placeholder="Example: How can I build a balanced weekly routine?",
+            )
+            if st.button(
+                "Ask Gemini",
+                key=f"ask_gemini_{current_user_id}",
+                use_container_width=True,
+            ):
+                if not question.strip():
+                    st.warning("Enter a question first.")
+                else:
+                    with st.spinner("Gemini is preparing a suggestion..."):
+                        try:
+                            st.session_state[
+                                f"gemini_answer_{current_user_id}"
+                            ] = ask_gemini(gemini_key, question.strip(), df)
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+            answer = st.session_state.get(f"gemini_answer_{current_user_id}")
+            if answer:
+                st.markdown(answer)
 
     st.divider()
     st.markdown("### 💡 Quick Tips")
@@ -479,18 +585,9 @@ with st.sidebar:
         "Start small, track progress, and keep moving."
     )
 
-    st.caption("Data files")
-    st.code("workouts.csv\nfitlog.db", language="text")
-
 # --------------------------------------------------
 # LOAD DATA
 # --------------------------------------------------
-
-df = load_workouts()
-today = date.today()
-
-if not df.empty:
-    df["date"] = pd.to_datetime(df["date"]).dt.date
 
 today_df = df[df["date"] == today] if not df.empty else df.copy()
 
@@ -660,6 +757,7 @@ with st.form("workout_entry_form", clear_on_submit=True):
         else:
             try:
                 save_workout(
+                    current_user_id,
                     workout_date,
                     selected_name,
                     duration,

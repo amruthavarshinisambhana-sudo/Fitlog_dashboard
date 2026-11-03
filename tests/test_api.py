@@ -2,35 +2,63 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from api import add_workout, list_workouts
+from fitlog_store import (
+    authenticate_user,
+    create_user,
+    list_workouts,
+    save_workout,
+)
 
 
-class FitLogApiTests(unittest.TestCase):
+class FitLogAccountTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_file = Path(self.temp_dir.name) / "test_fitlog.db"
+        self.legacy_csv = Path(self.temp_dir.name) / "missing_workouts.csv"
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_add_and_list_workout(self):
-        created = add_workout(
-            {
-                "date": "2026-11-03",
-                "workout": "  Running  ",
-                "duration": 30,
-                "calories": 200,
-            },
+    def create_account(self, username):
+        return create_user(
+            username,
+            "secure-pass-123",
             self.db_file,
+            self.legacy_csv,
         )
 
-        self.assertEqual(created["workout"], "Running")
-        self.assertEqual(created["duration"], 30)
-        self.assertEqual(list_workouts(self.db_file), [created])
+    def test_account_password_authentication(self):
+        user = self.create_account("amrutha")
 
-    def test_rejects_non_positive_duration(self):
+        self.assertEqual(
+            authenticate_user("amrutha", "secure-pass-123", self.db_file),
+            user,
+        )
+        self.assertIsNone(
+            authenticate_user("amrutha", "wrong-password", self.db_file)
+        )
+
+    def test_workouts_are_private_to_each_account(self):
+        first_user = self.create_account("runner_one")
+        second_user = self.create_account("runner_two")
+        workout = {
+            "date": "2026-11-03",
+            "workout": "  Running  ",
+            "duration": 30,
+            "calories": 200,
+        }
+
+        created = save_workout(first_user["id"], workout, self.db_file)
+
+        self.assertEqual(created["workout"], "Running")
+        self.assertEqual(list_workouts(first_user["id"], self.db_file), [created])
+        self.assertEqual(list_workouts(second_user["id"], self.db_file), [])
+
+    def test_rejects_invalid_records(self):
+        user = self.create_account("valid_user")
         with self.assertRaisesRegex(ValueError, "greater than zero"):
-            add_workout(
+            save_workout(
+                user["id"],
                 {
                     "date": "2026-11-03",
                     "workout": "Running",
@@ -39,10 +67,9 @@ class FitLogApiTests(unittest.TestCase):
                 },
                 self.db_file,
             )
-
-    def test_rejects_invalid_date(self):
         with self.assertRaisesRegex(ValueError, "Provide date"):
-            add_workout(
+            save_workout(
+                user["id"],
                 {
                     "date": "not-a-date",
                     "workout": "Running",

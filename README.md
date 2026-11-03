@@ -1,57 +1,59 @@
 # FitLog Dashboard
 
-A Streamlit workout tracker that saves workout history to `workouts.csv` and `fitlog.db`.
+FitLog is a Streamlit workout tracker with local accounts, private workout history, personal CSV reports, an authenticated local API, and an optional Gemini AI coach.
 
 ## Start the dashboard
 
-Open PowerShell in this folder, then run:
+Open PowerShell in this folder and run:
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m streamlit run "dashboard (1).py"
 ```
 
-## Data entry and report download
+Create an account from the **Sign up** tab the first time you open it. Sign in afterward to see that account's workouts. Passwords are stored as salted PBKDF2 hashes. Existing single-user workouts are assigned to the first account that signs up.
 
-The dashboard already includes a workout entry form and a CSV download button in Workout History. These features are in `dashboard (1).py`.
+## Log workouts and download reports
 
-## Start the JSON API
+Use **Log a Workout** to enter an activity. The dashboard stores it in SQLite under the signed-in account. The sidebar's **My Data Report** downloads only that account's workouts as CSV. The Workout History section also has filters and a CSV download.
 
-In a second PowerShell window in this folder, run:
+## Enable the Gemini AI Coach
+
+The optional coach uses Google's Gemini `generateContent` API. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then:
+
+1. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`.
+2. Replace the placeholder with your key, keeping the quotes:
+
+   ```toml
+   GEMINI_API_KEY = "your-key-goes-here"
+   ```
+
+3. Restart Streamlit and open **Gemini AI Coach** in the sidebar.
+
+The secrets file is ignored by Git. Do not commit or share the real key. When you ask Gemini a question, the app sends that question and a summary of your signed-in account's workouts to Google.
+
+## Local API
+
+Start it in a second PowerShell window:
 
 ```powershell
 python api.py
 ```
 
-The API listens only on your computer at `http://127.0.0.1:8000`.
+The API listens on `http://127.0.0.1:8000` and requires HTTP Basic authentication using a FitLog username and password.
 
-- `GET /api/health` checks that the API is running.
-- `GET /api/workouts` returns saved workouts as JSON.
-- `POST /api/workouts` adds a workout. Send JSON such as:
+- `GET /api/health` checks whether the API is running.
+- `GET /api/workouts` returns the authenticated account's workouts.
+- `POST /api/workouts` adds a workout to the authenticated account. Example JSON:
 
-```json
-{"date":"2026-11-03","workout":"Running","duration":30,"calories":200}
-```
+  ```json
+  {"date":"2026-11-03","workout":"Running","duration":30,"calories":200}
+  ```
 
-The POST endpoint validates the values and stores the workout in `fitlog.db`.
-
-## Run the test cases
+## Run the tests
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-## GitHub automatic checks
-
-The workflow in `.github/workflows/ci.yml` runs the tests when code is pushed to GitHub or a pull request is opened. To use it, create a GitHub repository, then initialize and connect this folder with Git:
-
-```powershell
-git init
-git add .
-git commit -m "Add FitLog project"
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
-git push -u origin main
-```
-
-Replace the sample GitHub address with your repository address. GitHub will show the automatic test result in the **Actions** tab.
+The tests cover password authentication, separate workout histories for different accounts, and invalid workout values. GitHub Actions runs them automatically when changes are pushed.
