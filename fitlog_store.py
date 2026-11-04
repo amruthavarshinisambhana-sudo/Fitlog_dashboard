@@ -33,8 +33,24 @@ def init_db(db_file=DB_FILE):
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
                     password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user'
+                        CHECK(role IN ('admin', 'user'))
                 )"""
+            )
+            user_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "role" not in user_columns:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
+                )
+            # Existing projects get one admin: the account created first.
+            conn.execute(
+                """UPDATE users SET role = 'admin'
+                   WHERE id = (SELECT MIN(id) FROM users)
+                   AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')"""
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS workouts (
@@ -150,13 +166,15 @@ def create_user(username, password, db_file=DB_FILE, legacy_csv_file=CSV_FILE):
                 existing_users = conn.execute(
                     "SELECT COUNT(*) AS count FROM users"
                 ).fetchone()["count"]
+                role = "admin" if existing_users == 0 else "user"
                 cursor = conn.execute(
-                    """INSERT INTO users (username, password_hash, created_at)
-                       VALUES (?, ?, ?)""",
+                    """INSERT INTO users (username, password_hash, created_at, role)
+                       VALUES (?, ?, ?, ?)""",
                     (
                         username,
                         _make_password_hash(password),
                         datetime.now(timezone.utc).isoformat(),
+                        role,
                     ),
                 )
                 user_id = cursor.lastrowid
@@ -169,19 +187,82 @@ def create_user(username, password, db_file=DB_FILE, legacy_csv_file=CSV_FILE):
                     _migrate_legacy_csv(conn, user_id, legacy_csv_file)
         except sqlite3.IntegrityError as exc:
             raise ValueError("That username is already registered.") from exc
-    return {"id": user_id, "username": username}
+    return {"id": user_id, "username": username, "role": role}
 
 
 def authenticate_user(username, password, db_file=DB_FILE):
     init_db(db_file)
     with closing(_connect(db_file)) as conn:
         user = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, role FROM users WHERE username = ?",
             (str(username or "").strip(),),
         ).fetchone()
     if not user or not _verify_password(str(password or ""), user["password_hash"]):
         return None
-    return {"id": user["id"], "username": user["username"]}
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+def get_user_role(user_id, db_file=DB_FILE):
+    init_db(db_file)
+    with closing(_connect(db_file)) as conn:
+        user = conn.execute(
+            "SELECT role FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    return user["role"] if user else None
+
+
+def list_users_for_admin(actor_user_id, db_file=DB_FILE):
+    """Return account metadata only, and only to a current administrator."""
+    init_db(db_file)
+    with closing(_connect(db_file)) as conn:
+        actor = conn.execute(
+            "SELECT role FROM users WHERE id = ?", (actor_user_id,)
+        ).fetchone()
+        if not actor or actor["role"] != "admin":
+            raise PermissionError("Administrator access is required.")
+        rows = conn.execute(
+            """SELECT users.id, users.username, users.role, users.created_at,
+                      COUNT(workouts.id) AS workout_count
+               FROM users LEFT JOIN workouts ON workouts.user_id = users.id
+               GROUP BY users.id ORDER BY users.id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_user_role(actor_user_id, target_user_id, role, db_file=DB_FILE):
+    """Let an administrator change another user's role without removing the last admin."""
+    if role not in {"admin", "user"}:
+        raise ValueError("Role must be 'admin' or 'user'.")
+    if actor_user_id == target_user_id:
+        raise ValueError("You cannot change your own role.")
+
+    init_db(db_file)
+    with closing(_connect(db_file)) as conn:
+        with conn:
+            actor = conn.execute(
+                "SELECT role FROM users WHERE id = ?", (actor_user_id,)
+            ).fetchone()
+            if not actor or actor["role"] != "admin":
+                raise PermissionError("Administrator access is required.")
+            target = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (target_user_id,)
+            ).fetchone()
+            if not target:
+                raise ValueError("That account does not exist.")
+            if role == "user":
+                admin_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM users WHERE role = 'admin'"
+                ).fetchone()["count"]
+                target_role = conn.execute(
+                    "SELECT role FROM users WHERE id = ?", (target_user_id,)
+                ).fetchone()["role"]
+                if target_role == "admin" and admin_count <= 1:
+                    raise ValueError("FitLog must keep at least one administrator.")
+            conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, target_user_id))
 
 
 def list_workouts(user_id, db_file=DB_FILE):

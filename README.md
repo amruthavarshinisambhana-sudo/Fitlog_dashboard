@@ -1,6 +1,6 @@
 # FitLog Dashboard
 
-FitLog is a Streamlit workout tracker with local accounts, private workout history, personal CSV reports, an authenticated local API, and an optional Gemini AI coach.
+FitLog is a Streamlit workout tracker with local accounts, private workout history, personal CSV reports, an authenticated local API, and an optional Anthropic Claude coach.
 
 ## Start the dashboard
 
@@ -11,7 +11,7 @@ python -m pip install -r requirements.txt
 python -m streamlit run "dashboard (1).py"
 ```
 
-Create an account from the **Sign up** tab the first time you open it. Sign in afterward to see that account's workouts. Passwords are stored as salted PBKDF2 hashes. Existing single-user workouts are assigned to the first account that signs up.
+Create an account from the **Sign up** tab the first time you open it. The first account becomes the administrator; accounts created afterward are regular users. Administrators can view account names, roles, and workout counts in **Admin Panel**, and change another account's role. The panel does not expose workout entries. Sign in to see your account's workouts. Passwords are stored as salted PBKDF2 hashes. Existing single-user workouts are assigned to the first account that signs up.
 
 ## Log workouts and download reports
 
@@ -21,11 +21,11 @@ Use **Log a Workout** to enter an activity. The dashboard stores it in SQLite un
 
 Open **Backup & SQLite** in the sidebar. **Export full JSON snapshot** creates a backup of the signed-in account's workouts. **Export SQLite SQL dump** downloads SQL statements that can be opened with SQLite tools. To restore, upload a FitLog JSON snapshot and select **Restore JSON backup to my account**. Existing matching workouts are skipped to avoid duplicates. CSV download is available under **My Data Report**.
 
-## Enable the Gemini AI Coach
+## Enable the Claude AI Coach
 
-The optional coach uses Google's Gemini Interactions API. Create an authorization key in [Google AI Studio](https://aistudio.google.com/api-keys), open **Ask AI Gemini** in the sidebar, and paste the key into the masked **Gemini API key** field. The key stays in the active Streamlit session and is not saved to the project files. Do not share the key. When you ask Gemini a question, the app sends that question and a summary of your signed-in account's workouts to Google.
+The optional coach uses Anthropic's Messages API. Create an API key in the [Anthropic Console](https://console.anthropic.com/), open **Claude AI Coach** in the sidebar, and paste the key into the masked **Anthropic API key** field. The key stays in the active Streamlit session and is not saved to the project files. Do not share it. You can ask questions about your signed-in account's report or ask general questions. The app sends your question and a report summary to Anthropic with each request.
 
-For repeat local use, you can instead save the key in `.streamlit/secrets.toml` as `GEMINI_API_KEY = "your-key"`. That file is ignored by Git; never commit it.
+For repeat local use, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set `ANTHROPIC_API_KEY = "your-key"`. That file is ignored by Git; never commit it.
 
 ## Local API
 

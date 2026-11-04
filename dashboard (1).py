@@ -14,9 +14,12 @@ import plotly.graph_objects as go
 from fitlog_store import (
     authenticate_user,
     create_user,
+    get_user_role,
     init_db,
+    list_users_for_admin,
     list_workouts as list_user_workouts,
     save_workout as save_user_workout,
+    set_user_role,
 )
 
 # --------------------------------------------------
@@ -379,60 +382,89 @@ def normalize_backup_records(records):
     return normalized
 
 
-def get_gemini_api_key():
+def get_anthropic_api_key():
     placeholder = "PASTE_NEW_KEY_HERE"
     try:
-        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         secret_key = str(secret_key).strip()
         if secret_key and secret_key != placeholder:
             return secret_key
     except Exception:
         pass
 
-    for filename in ("key.txt", "keys.txt"):
-        key_path = BASE_DIR / ".streamlit" / filename
-        try:
-            saved_key = key_path.read_text(encoding="utf-8-sig").strip()
-        except OSError:
-            continue
-        if "=" in saved_key:
-            setting_name, setting_value = saved_key.split("=", 1)
-            if setting_name.strip().upper() in {"KEY", "GEMINI_API_KEY"}:
-                saved_key = setting_value.strip().strip("\"'")
-        if saved_key and saved_key != placeholder:
-            return saved_key
-
-    environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    environment_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     return "" if environment_key == placeholder else environment_key
 
 
-def ask_gemini(api_key, question, user_df):
-    """Ask Gemini for a fitness suggestion using this user's summary only."""
+def ask_anthropic(api_key, question, user_df):
+    """Answer general questions and questions about this user's workout report."""
     activities = []
+    recent_workouts = []
     if not user_df.empty:
-        totals = user_df.groupby("workout")["duration"].sum().to_dict()
-        activities = [f"{name}: {int(minutes)} minutes" for name, minutes in totals.items()]
-    summary = (
-        f"Workouts recorded: {len(user_df)}; "
-        f"total minutes: {int(user_df['duration'].sum()) if not user_df.empty else 0}; "
-        f"total calories: {int(user_df['calories'].sum()) if not user_df.empty else 0}; "
-        f"minutes by activity: {', '.join(activities) if activities else 'none yet'}."
+        grouped = user_df.groupby("workout").agg(
+            sessions=("workout", "size"),
+            minutes=("duration", "sum"),
+            calories=("calories", "sum"),
+        )
+        activities = [
+            f"{name}: {int(row.sessions)} sessions, {int(row.minutes)} minutes, "
+            f"{int(row.calories)} calories"
+            for name, row in grouped.iterrows()
+        ]
+        recent = user_df.sort_values("date").tail(10)
+        recent_workouts = [
+            f"{row.date}: {row.workout}, {int(row.duration)} minutes, "
+            f"{int(row.calories)} calories"
+            for row in recent.itertuples(index=False)
+        ]
+        date_range = (
+            f"{user_df['date'].min()} to {user_df['date'].max()}"
+        )
+    else:
+        date_range = "no workouts recorded"
+
+    summary = "\n".join(
+        [
+            f"Workout records: {len(user_df)}",
+            f"Date range: {date_range}",
+            f"Total workout minutes: {int(user_df['duration'].sum()) if not user_df.empty else 0}",
+            f"Total recorded calories: {int(user_df['calories'].sum()) if not user_df.empty else 0}",
+            "Breakdown by activity: " + ("; ".join(activities) if activities else "none yet"),
+            "Most recent workout records: " + ("; ".join(recent_workouts) if recent_workouts else "none yet"),
+        ]
     )
     prompt = (
-        "You are a supportive general fitness coach. Give practical, "
-        "beginner-friendly suggestions based only on the workout summary. "
-        "Do not diagnose medical conditions.\n\n"
-        f"My workout summary: {summary}\nMy question: {question}"
+        "The following is a summary of the signed-in user's FitLog report. "
+        "Use it when relevant, and answer other general questions too.\n\n"
+        f"FITLOG REPORT:\n{summary}\n\nQUESTION:\n{question}"
     )
-    payload = {"model": "gemini-3.8-flash", "input": prompt}
-    endpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 600,
+        "system": (
+            "You are a helpful general-purpose assistant in the FitLog app. "
+            "Answer questions about the user's FitLog report using the supplied "
+            "report summary, and answer questions on other topics with general "
+            "knowledge. Do not claim to know personal report details that were not "
+            "provided; say when the report does not contain enough information. "
+            "Keep answers clear and practical. For health questions, provide "
+            "general information only, do not diagnose or prescribe treatment, "
+            "and advise contacting a qualified clinician when appropriate."
+        ),
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    endpoint = "https://api.anthropic.com/v1/messages"
     req = request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
         method="POST",
     )
-    retryable_statuses = {408, 429, 500, 502, 503, 504}
+    retryable_statuses = {408, 429, 500, 502, 503, 504, 529}
     result = None
     for attempt in range(3):
         try:
@@ -443,27 +475,25 @@ def ask_gemini(api_key, question, user_df):
             details = exc.read().decode("utf-8", errors="replace")
             if exc.code not in retryable_statuses or attempt == 2:
                 raise RuntimeError(
-                    f"Gemini API returned HTTP {exc.code}: {details[:400]}"
+                    f"Anthropic API returned HTTP {exc.code}: {details[:400]}"
                 ) from exc
             exc.close()
         except (error.URLError, TimeoutError) as exc:
             if attempt == 2:
-                raise RuntimeError(f"Could not reach Gemini: {exc}") from exc
+                raise RuntimeError(f"Could not reach Anthropic: {exc}") from exc
         time.sleep((2 ** attempt) + random.uniform(0, 0.5))
 
     try:
         answer_parts = [
-            part["text"]
-            for step in result.get("steps", [])
-            if step.get("type") == "model_output"
-            for part in step.get("content", [])
-            if part.get("type") == "text" and part.get("text")
+            block["text"]
+            for block in result.get("content", [])
+            if block.get("type") == "text" and block.get("text")
         ]
         if answer_parts:
             return "\n".join(answer_parts)
     except (AttributeError, TypeError) as exc:
-        raise RuntimeError("Gemini returned an empty or unexpected response.") from exc
-    raise RuntimeError("Gemini returned no text response.")
+        raise RuntimeError("Anthropic returned an empty or unexpected response.") from exc
+    raise RuntimeError("Anthropic returned no text response.")
 
 
 # --------------------------------------------------
@@ -489,13 +519,15 @@ if "fitlog_user_id" not in st.session_state:
             if user:
                 st.session_state["fitlog_user_id"] = user["id"]
                 st.session_state["fitlog_username"] = user["username"]
+                st.session_state["fitlog_user_role"] = user["role"]
                 st.rerun()
             st.error("Username or password is incorrect.")
 
     with signup_tab:
         st.info(
-            "Your password is stored as a secure hash. Existing workout records "
-            "will belong to the first account created."
+            "Your password is stored as a secure hash. The first account becomes "
+            "the administrator; later accounts are regular users. Existing workout "
+            "records will belong to the first account created."
         )
         with st.form("fitlog_signup_form"):
             signup_username = st.text_input("Choose a username", key="signup_username")
@@ -522,6 +554,7 @@ if "fitlog_user_id" not in st.session_state:
                     )
                     st.session_state["fitlog_user_id"] = user["id"]
                     st.session_state["fitlog_username"] = user["username"]
+                    st.session_state["fitlog_user_role"] = user["role"]
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
@@ -529,6 +562,10 @@ if "fitlog_user_id" not in st.session_state:
 
 current_user_id = st.session_state["fitlog_user_id"]
 current_username = st.session_state["fitlog_username"]
+current_user_role = get_user_role(current_user_id)
+if current_user_role is None:
+    st.session_state.clear()
+    st.rerun()
 df = load_workouts(current_user_id)
 today = date.today()
 if not df.empty:
@@ -541,12 +578,75 @@ if not df.empty:
 with st.sidebar:
     st.markdown("## 🌿 FitLog")
     st.caption("Your personal fitness companion")
-    st.caption(f"Signed in as **{current_username}**")
+    st.caption(f"Signed in as **{current_username}** · {current_user_role.title()}")
     if st.button("Log out", use_container_width=True):
         st.session_state.pop("fitlog_user_id", None)
         st.session_state.pop("fitlog_username", None)
+        st.session_state.pop("fitlog_user_role", None)
         st.rerun()
     st.divider()
+
+    if current_user_role == "admin":
+        with st.expander("🛡️ Admin Panel", expanded=False):
+            try:
+                admin_users = list_users_for_admin(current_user_id)
+                st.caption(
+                    "Manage account roles. This panel shows account details and "
+                    "workout counts, not personal workout entries."
+                )
+                st.dataframe(
+                    [
+                        {
+                            "Username": user["username"],
+                            "Role": user["role"].title(),
+                            "Joined": user["created_at"][:10],
+                            "Workout count": user["workout_count"],
+                        }
+                        for user in admin_users
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                manageable_users = [
+                    user for user in admin_users if user["id"] != current_user_id
+                ]
+                if manageable_users:
+                    users_by_id = {user["id"]: user for user in manageable_users}
+                    selected_user = st.selectbox(
+                        "Choose an account",
+                        list(users_by_id),
+                        format_func=lambda user_id: (
+                            f"{users_by_id[user_id]['username']} "
+                            f"({users_by_id[user_id]['role']})"
+                        ),
+                        key=f"admin_target_{current_user_id}",
+                    )
+                    selected_user = users_by_id[selected_user]
+                    new_role = st.selectbox(
+                        "Set role",
+                        ["user", "admin"],
+                        index=0 if selected_user["role"] == "admin" else 1,
+                        key=f"admin_new_role_{current_user_id}_{selected_user['id']}",
+                    )
+                    if st.button(
+                        "Update account role",
+                        key=f"admin_update_role_{current_user_id}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            set_user_role(
+                                current_user_id, selected_user["id"], new_role
+                            )
+                            st.success(
+                                f"{selected_user['username']}'s role is now {new_role}."
+                            )
+                            st.rerun()
+                        except (PermissionError, ValueError) as exc:
+                            st.error(str(exc))
+                else:
+                    st.caption("There are no other accounts to manage yet.")
+            except PermissionError:
+                st.error("Administrator access is required.")
 
     st.markdown("### 🎯 Daily Goals")
     daily_minutes_goal = st.number_input(
@@ -696,44 +796,45 @@ with st.sidebar:
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 st.error(f"Could not restore that backup: {exc}")
 
-    with st.expander("✨ Ask AI Gemini", expanded=False):
-        gemini_key = get_gemini_api_key()
-        if not gemini_key:
+    with st.expander("✨ Claude AI Coach", expanded=False):
+        anthropic_key = get_anthropic_api_key()
+        if not anthropic_key:
             st.caption(
-                "Create a Gemini API key in Google AI Studio. It stays in this "
+                "Create an Anthropic API key in the Anthropic Console. It stays in this "
                 "browser session and is not saved to your project files."
             )
-            gemini_key = st.text_input(
-                "Gemini API key",
+            anthropic_key = st.text_input(
+                "Anthropic API key",
                 type="password",
-                key=f"gemini_session_key_{current_user_id}",
+                key=f"anthropic_session_key_{current_user_id}",
                 help="Paste your key here. It is kept only for this active app session.",
             )
-        if gemini_key:
+        if anthropic_key:
             st.caption(
-                "Your question and a summary of your workouts are sent to Google Gemini."
+                "Your question and a summary of your workouts are sent to Anthropic Claude. "
+                "You can ask about your report or other general topics."
             )
             question = st.text_area(
-                "Ask about your workout progress",
-                key=f"gemini_question_{current_user_id}",
-                placeholder="Example: How can I build a balanced weekly routine?",
+                "Ask about your report or any other question",
+                key=f"anthropic_question_{current_user_id}",
+                placeholder="Example: Summarize my report, or ask a general question...",
             )
             if st.button(
-                "Ask AI Gemini",
-                key=f"ask_gemini_{current_user_id}",
+                "Ask Claude",
+                key=f"ask_anthropic_{current_user_id}",
                 use_container_width=True,
             ):
                 if not question.strip():
                     st.warning("Enter a question first.")
                 else:
-                    with st.spinner("Gemini is preparing a suggestion..."):
+                    with st.spinner("Claude is preparing a suggestion..."):
                         try:
                             st.session_state[
-                                f"gemini_answer_{current_user_id}"
-                            ] = ask_gemini(gemini_key, question.strip(), df)
+                                f"anthropic_answer_{current_user_id}"
+                            ] = ask_anthropic(anthropic_key, question.strip(), df)
                         except RuntimeError as exc:
                             st.error(str(exc))
-            answer = st.session_state.get(f"gemini_answer_{current_user_id}")
+            answer = st.session_state.get(f"anthropic_answer_{current_user_id}")
             if answer:
                 st.markdown(answer)
 
@@ -756,8 +857,8 @@ with st.sidebar:
         st.markdown("**Why can’t I see another account’s workouts?**")
         st.caption("FitLog keeps each account’s workout history separate. Sign in with the account that recorded those workouts.")
 
-        st.markdown("**What if Gemini shows a 503 error?**")
-        st.caption("Gemini may be temporarily busy. Wait a little and try Ask Gemini again. The FAQ works without a Gemini key.")
+        st.markdown("**What if Claude shows a 429 or 529 error?**")
+        st.caption("Wait briefly and try again. These errors can mean a rate limit or temporary service load. The FAQ works without an Anthropic key.")
 
         st.markdown("**How do I view the project tests?**")
         st.caption(
