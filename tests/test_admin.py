@@ -4,7 +4,9 @@ from fitlog_store import (
     create_user,
     get_user_role,
     list_users_for_admin,
+    reset_first_admin_password,
     set_user_role,
+    authenticate_user,
 )
 
 
@@ -61,3 +63,29 @@ def test_admin_cannot_change_own_role(accounts_db):
 
     with pytest.raises(ValueError, match="own role"):
         set_user_role(admin["id"], admin["id"], "user", accounts_db)
+
+
+def test_recovery_code_resets_only_the_first_admin_password(accounts_db):
+    admin = make_user(accounts_db, "recovery_admin")
+    member = make_user(accounts_db, "recovery_member")
+    code = "c" * 43
+
+    assert reset_first_admin_password("incorrect", "new-secure-pass", code, accounts_db) is None
+    assert authenticate_user("recovery_admin", "secure-pass-123", accounts_db)
+
+    result = reset_first_admin_password(code, "new-secure-pass", code, accounts_db)
+
+    assert result == {"username": "recovery_admin"}
+    assert authenticate_user("recovery_admin", "new-secure-pass", accounts_db)
+    assert authenticate_user("recovery_admin", "secure-pass-123", accounts_db) is None
+    assert authenticate_user("recovery_member", "secure-pass-123", accounts_db)
+    assert get_user_role(admin["id"], accounts_db) == "admin"
+    assert get_user_role(member["id"], accounts_db) == "user"
+
+
+def test_recovery_requires_a_long_configured_code(accounts_db):
+    make_user(accounts_db, "recovery_admin")
+
+    assert reset_first_admin_password("short", "new-secure-pass", "short", accounts_db) is None
+    with pytest.raises(ValueError, match="8 characters"):
+        reset_first_admin_password("x" * 32, "tiny", "x" * 32, accounts_db)

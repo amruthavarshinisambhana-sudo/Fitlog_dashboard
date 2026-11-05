@@ -18,6 +18,7 @@ from fitlog_store import (
     init_db,
     list_users_for_admin,
     list_workouts as list_user_workouts,
+    reset_first_admin_password,
     save_workout as save_user_workout,
     set_user_role,
 )
@@ -505,7 +506,9 @@ init_db()
 if "fitlog_user_id" not in st.session_state:
     st.markdown("## 🌿 Welcome to FitLog")
     st.caption("Sign in to see your private workout history, or create an account.")
-    login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+    login_tab, signup_tab, recovery_tab = st.tabs(
+        ["Log in", "Sign up", "Admin recovery"]
+    )
 
     with login_tab:
         with st.form("fitlog_login_form"):
@@ -558,6 +561,69 @@ if "fitlog_user_id" not in st.session_state:
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
+
+    with recovery_tab:
+        st.caption(
+            "Reset the first administrator account with the recovery code configured "
+            "in the app's private Secrets settings."
+        )
+        recovery_secret = ""
+        try:
+            recovery_secret = str(
+                st.secrets.get("FITLOG_ADMIN_RECOVERY_CODE", "")
+            ).strip()
+        except Exception:
+            # Secrets are optional for local runs; recovery stays unavailable without one.
+            pass
+        if len(recovery_secret) < 32:
+            st.info(
+                "Admin recovery is not configured. The app owner must add a strong "
+                "FITLOG_ADMIN_RECOVERY_CODE in Streamlit Secrets."
+            )
+        else:
+            with st.form("fitlog_admin_recovery_form"):
+                recovery_code = st.text_input(
+                    "Admin recovery code", type="password", key="admin_recovery_code"
+                )
+                recovery_password = st.text_input(
+                    "New admin password (8+ characters)",
+                    type="password",
+                    key="admin_recovery_password",
+                )
+                recovery_password_confirm = st.text_input(
+                    "Confirm new password",
+                    type="password",
+                    key="admin_recovery_password_confirm",
+                )
+                recovery_submitted = st.form_submit_button(
+                    "Reset admin password", use_container_width=True
+                )
+            if recovery_submitted:
+                if recovery_password != recovery_password_confirm:
+                    st.error("The passwords do not match.")
+                else:
+                    try:
+                        recovered_admin = reset_first_admin_password(
+                            recovery_code,
+                            recovery_password,
+                            recovery_secret,
+                        )
+                        if recovered_admin:
+                            st.success(
+                                "Admin password reset. Sign in with the displayed "
+                                "admin username and your new password."
+                            )
+                            st.info(
+                                f"Admin username: {recovered_admin['username']}. "
+                                "Rotate the recovery code in Streamlit Secrets now; "
+                                "the current code remains usable until changed."
+                            )
+                        else:
+                            st.error(
+                                "Recovery failed. Check the recovery code and try again."
+                            )
+                    except ValueError as exc:
+                        st.error(str(exc))
     st.stop()
 
 current_user_id = st.session_state["fitlog_user_id"]

@@ -206,6 +206,30 @@ def authenticate_user(username, password, db_file=DB_FILE):
     }
 
 
+def reset_first_admin_password(recovery_code, new_password, configured_code, db_file=DB_FILE):
+    """Reset the first administrator's password using a private deployment secret."""
+    expected = str(configured_code or "")
+    supplied = str(recovery_code or "")
+    if len(expected) < 32 or not secrets.compare_digest(supplied, expected):
+        return None
+    if len(new_password or "") < 8:
+        raise ValueError("Password must contain at least 8 characters.")
+
+    init_db(db_file)
+    with closing(_connect(db_file)) as conn:
+        with conn:
+            admin = conn.execute(
+                "SELECT id, username FROM users WHERE role = 'admin' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if not admin:
+                return None
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (_make_password_hash(new_password), admin["id"]),
+            )
+    return {"username": admin["username"]}
+
+
 def get_user_role(user_id, db_file=DB_FILE):
     init_db(db_file)
     with closing(_connect(db_file)) as conn:

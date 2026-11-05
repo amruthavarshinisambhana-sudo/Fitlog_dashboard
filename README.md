@@ -13,6 +13,22 @@ python -m streamlit run "dashboard (1).py"
 
 Create an account from the **Sign up** tab the first time you open it. The first account becomes the administrator; accounts created afterward are regular users. Administrators can view account names, roles, and workout counts in **Admin Panel**, and change another account's role. The panel does not expose workout entries. Sign in to see your account's workouts. Passwords are stored as salted PBKDF2 hashes. Existing single-user workouts are assigned to the first account that signs up.
 
+## Recover the administrator password
+
+The login page has an **Admin recovery** tab. To enable it, generate a strong recovery code locally:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Add the result to the deployed app's private Streamlit **Settings → Secrets** as TOML:
+
+```toml
+FITLOG_ADMIN_RECOVERY_CODE = "paste-the-generated-value-here"
+```
+
+Never commit or share this code. In the app, use **Admin recovery**, enter the code, and choose a new password. Recovery resets the first administrator account; after success, replace the code in Streamlit Secrets with a newly generated value so the old code cannot be reused. The app never stores or displays the recovery code.
+
 ## Log workouts and download reports
 
 Use **Log a Workout** to enter an activity. The dashboard stores it in SQLite under the signed-in account. The sidebar's **My Data Report** downloads only that account's workouts as CSV. The Workout History section also has filters and a CSV download.
